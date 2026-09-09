@@ -1,0 +1,39 @@
+# ── Phone app (separate project, not part of the desktop assistant) ──
+microgent/
+Angel.apk
+
+# ── Python environment & caches ──
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Runtime artifacts / generated audio ──
+.runtime_audio/
+*.wav
+
+# ── Secrets / credentials ──
+key.py
+.env
+
+# ── Editor / IDE ──
+.idea/
+*.code-workspace
+
+# ── Temp & scratch files from development ──
+_tmp_*
+_t.txt
+_build.log
+_cfg*.log
+_rel*.log
+_init.log
+_apk.log
+_pv*.txt
+_vc.txt
+_ic*.txt
+_ma.txt
+_lan.txt
+_r.txt
+res.txt
+samples/
+tts_probe.wav

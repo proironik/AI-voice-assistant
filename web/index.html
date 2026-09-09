@@ -1,0 +1,1182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Angel — Voice Assistant</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      /* Music-reactive values, written from JS once per frame. Driving the
+         visuals through custom properties keeps the animation in the
+         compositor instead of thrashing individual style rules. */
+      :root {
+        --beat: 0; /* 0..1, decays after each detected beat */
+        --energy: 0; /* 0..1, smoothed overall level */
+        --bass: 0; /* 0..1, smoothed low band */
+      }
+
+      body {
+        background: #1a1408;
+        background: radial-gradient(
+          ellipse at center,
+          #2a1f0a 0%,
+          #1a1408 50%,
+          #0d0a04 100%
+        );
+        color: #d4a726;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+      }
+
+      /* Golden aurora behind everything. Three blobs drift on their own slow
+         timers and swell with the music, so the background keeps moving even
+         between beats. */
+      .ambient {
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        overflow: hidden;
+      }
+
+      .blob {
+        position: absolute;
+        border-radius: 50%;
+        filter: blur(70px);
+        opacity: calc(0.18 + var(--energy) * 0.5);
+        transform: scale(calc(1 + var(--bass) * 0.45));
+        transition:
+          opacity 0.12s linear,
+          transform 0.12s ease-out;
+        will-change: opacity, transform;
+      }
+
+      .blob.one {
+        width: 46vw;
+        height: 46vw;
+        left: -8vw;
+        top: -6vw;
+        background: radial-gradient(
+          circle,
+          rgba(212, 167, 38, 0.55),
+          transparent 70%
+        );
+        animation: drift-one 23s ease-in-out infinite;
+      }
+
+      .blob.two {
+        width: 40vw;
+        height: 40vw;
+        right: -6vw;
+        bottom: -8vw;
+        background: radial-gradient(
+          circle,
+          rgba(255, 196, 84, 0.45),
+          transparent 70%
+        );
+        animation: drift-two 31s ease-in-out infinite;
+      }
+
+      .blob.three {
+        width: 34vw;
+        height: 34vw;
+        left: 32vw;
+        bottom: -14vw;
+        background: radial-gradient(
+          circle,
+          rgba(166, 124, 0, 0.5),
+          transparent 70%
+        );
+        animation: drift-three 27s ease-in-out infinite;
+      }
+
+      @keyframes drift-one {
+        0%,
+        100% {
+          margin: 0 0;
+        }
+        50% {
+          margin: 6vh 8vw;
+        }
+      }
+
+      @keyframes drift-two {
+        0%,
+        100% {
+          margin: 0 0;
+        }
+        50% {
+          margin: -7vh -6vw;
+        }
+      }
+
+      @keyframes drift-three {
+        0%,
+        100% {
+          margin: 0 0;
+        }
+        50% {
+          margin: -5vh 7vw;
+        }
+      }
+
+      /* A single pulse of light on every detected beat. */
+      .beat-flash {
+        position: fixed;
+        inset: 0;
+        z-index: 1;
+        pointer-events: none;
+        background: radial-gradient(
+          ellipse at center,
+          rgba(255, 205, 100, 0.16),
+          transparent 62%
+        );
+        opacity: var(--beat);
+        transition: opacity 0.09s ease-out;
+        will-change: opacity;
+      }
+
+      .container {
+        position: relative;
+        z-index: 2;
+      }
+
+      /* Users who ask for reduced motion get the data-driven glow but not the
+         constant drifting. */
+      @media (prefers-reduced-motion: reduce) {
+        .blob {
+          animation: none;
+        }
+      }
+
+      .container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 30px;
+        width: 100%;
+        max-width: 700px;
+        padding: 20px;
+      }
+
+      /* Circular visualizer area */
+      .visualizer-wrapper {
+        position: relative;
+        width: 320px;
+        height: 320px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      /* Outer glow rings. Both scale and brighten with the music: the outer
+         ring rides the beat, the inner one follows sustained bass so they do
+         not move as one flat unit. */
+      .ring-outer {
+        position: absolute;
+        width: 320px;
+        height: 320px;
+        border-radius: 50%;
+        border: 1px solid rgba(212, 167, 38, calc(0.15 + var(--beat) * 0.65));
+        box-shadow:
+          0 0 40px rgba(212, 167, 38, calc(0.05 + var(--beat) * 0.5)),
+          0 0 90px rgba(255, 200, 90, calc(var(--beat) * 0.28));
+        transform: scale(calc(1 + var(--beat) * 0.035));
+        transition:
+          transform 0.11s ease-out,
+          box-shadow 0.11s linear,
+          border-color 0.11s linear;
+        will-change: transform, box-shadow;
+      }
+
+      .ring-inner {
+        position: absolute;
+        width: 270px;
+        height: 270px;
+        border-radius: 50%;
+        border: 1px solid rgba(212, 167, 38, calc(0.25 + var(--bass) * 0.5));
+        transform: scale(calc(1 + var(--bass) * 0.022));
+        transition:
+          transform 0.14s ease-out,
+          border-color 0.14s linear;
+        box-shadow:
+          0 0 60px rgba(212, 167, 38, 0.08) inset,
+          0 0 30px rgba(212, 167, 38, 0.05);
+        background: radial-gradient(
+          circle,
+          rgba(42, 31, 10, 0.8) 0%,
+          rgba(26, 20, 8, 0.9) 100%
+        );
+      }
+
+      /* Center icon + name */
+      .center-content {
+        position: absolute;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        z-index: 2;
+      }
+
+      .icon {
+        /* Auto height keeps the mark's 256x217 aspect ratio intact. */
+        width: 46px;
+        height: auto;
+        opacity: 0.92;
+        /* The artwork is already theme-gold; the glow just seats it against
+           the darker ring behind it, and swells on the beat. */
+        filter: drop-shadow(
+          0 0 calc(6px + var(--beat) * 22px)
+            rgba(212, 167, 38, calc(0.35 + var(--beat) * 0.6))
+        );
+        transform: scale(calc(1 + var(--beat) * 0.07));
+        transition:
+          transform 0.1s ease-out,
+          filter 0.1s linear;
+        will-change: transform, filter;
+        user-select: none;
+      }
+
+      .name {
+        font-size: 16px;
+        font-weight: 500;
+        color: #d4a726;
+        letter-spacing: 1px;
+      }
+
+      /* Waveform canvas inside the circle */
+      .waveform-canvas {
+        position: absolute;
+        bottom: 55px;
+        width: 200px;
+        height: 50px;
+        z-index: 1;
+      }
+
+      /* Text boxes area */
+      .text-area {
+        display: flex;
+        gap: 16px;
+        width: 100%;
+      }
+
+      .text-box {
+        flex: 1;
+        background: rgba(42, 31, 10, 0.6);
+        border: 1px solid rgba(212, 167, 38, 0.3);
+        border-radius: 12px;
+        padding: 16px;
+        min-height: 120px;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .text-box-label {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        color: rgba(212, 167, 38, 0.6);
+        margin-bottom: 10px;
+      }
+
+      .text-box-content {
+        flex: 1;
+        font-size: 14px;
+        line-height: 1.6;
+        color: #e8d59a;
+      }
+
+      #user-input {
+        background: transparent;
+        border: none;
+        outline: none;
+        color: #e8d59a;
+        font-size: 14px;
+        line-height: 1.6;
+        font-family: inherit;
+        resize: none;
+        width: 100%;
+        height: 100%;
+      }
+
+      #user-input::placeholder {
+        color: rgba(212, 167, 38, 0.35);
+      }
+
+      #llm-output {
+        color: #e8d59a;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        overflow-y: auto;
+        max-height: 200px;
+      }
+
+      /* Subtle ambient animation on the rings */
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 0.6;
+          transform: scale(1);
+        }
+        50% {
+          opacity: 1;
+          transform: scale(1.02);
+        }
+      }
+
+      .ring-outer {
+        animation: pulse 4s ease-in-out infinite;
+      }
+
+      .ring-inner {
+        animation: pulse 4s ease-in-out infinite 1s;
+      }
+
+      /* Service indicator pills */
+      .service-pills {
+        display: flex;
+        gap: 10px;
+        justify-content: center;
+      }
+
+      .pill {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        letter-spacing: 0.5px;
+        color: rgba(212, 167, 38, 0.55);
+        background: rgba(42, 31, 10, 0.5);
+        border: 1px solid rgba(212, 167, 38, 0.18);
+        border-radius: 20px;
+        padding: 5px 12px;
+        transition: all 0.3s;
+      }
+
+      .pill .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #6b5a2a;
+        transition: all 0.3s;
+      }
+
+      .pill.up {
+        color: #d4a726;
+        border-color: rgba(212, 167, 38, 0.45);
+      }
+
+      .pill.up .dot {
+        background: #8fc93a;
+        box-shadow: 0 0 8px rgba(143, 201, 58, 0.7);
+      }
+
+      /* Port is open but the model isn't resident yet. */
+      .pill.warming .dot {
+        background: #d99a4e;
+        box-shadow: 0 0 8px rgba(217, 154, 78, 0.7);
+        animation: blink 1s infinite;
+      }
+
+      /* Media player — fixed top-right, out of the document flow so it never
+         causes scrolling. Controls whatever is playing on this machine. */
+      .media-player {
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        background: rgba(26, 20, 8, 0.92);
+        border: 1px solid rgba(212, 167, 38, calc(0.3 + var(--beat) * 0.55));
+        border-radius: 12px;
+        padding: 10px 14px;
+        backdrop-filter: blur(8px);
+        box-shadow: 0 0 calc(var(--beat) * 26px)
+          rgba(212, 167, 38, calc(var(--beat) * 0.4));
+        transition:
+          opacity 0.3s,
+          box-shadow 0.11s linear,
+          border-color 0.11s linear;
+        max-width: 340px;
+      }
+
+      .media-player.idle {
+        opacity: 0.45;
+      }
+
+      .media-info {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .media-label {
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 1.2px;
+        color: rgba(212, 167, 38, 0.5);
+        margin-bottom: 2px;
+      }
+
+      .media-title,
+      .media-artist {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .media-title {
+        font-size: 13px;
+        color: #e8d59a;
+      }
+
+      .media-artist {
+        font-size: 11px;
+        color: rgba(232, 213, 154, 0.5);
+        min-height: 15px;
+      }
+
+      .media-controls {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .media-btn {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: rgba(212, 167, 38, 0.1);
+        border: 1px solid rgba(212, 167, 38, 0.35);
+        color: #e8d59a;
+        font-size: 13px;
+        line-height: 1;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s;
+      }
+
+      .media-btn:hover {
+        background: rgba(212, 167, 38, 0.25);
+        transform: translateY(-1px);
+      }
+
+      .media-btn:active {
+        transform: translateY(0);
+      }
+
+      .media-btn:focus-visible {
+        outline: 2px solid #d4a726;
+        outline-offset: 2px;
+      }
+
+      .media-btn.play {
+        width: 38px;
+        height: 38px;
+        font-size: 15px;
+        background: linear-gradient(135deg, #d4a726, #a67c00);
+        color: #1a1408;
+        border: none;
+        box-shadow: 0 2px 10px rgba(212, 167, 38, 0.25);
+      }
+
+      .media-btn.play:hover {
+        box-shadow: 0 4px 14px rgba(212, 167, 38, 0.4);
+      }
+
+      /* Start button */
+      #start-btn {
+        background: linear-gradient(135deg, #d4a726, #a67c00);
+        color: #1a1408;
+        border: none;
+        border-radius: 10px;
+        padding: 14px 40px;
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        cursor: pointer;
+        transition: all 0.2s;
+        box-shadow: 0 4px 20px rgba(212, 167, 38, 0.3);
+      }
+
+      #start-btn:hover:not(:disabled) {
+        transform: translateY(-1px);
+        box-shadow: 0 6px 25px rgba(212, 167, 38, 0.5);
+      }
+
+      #start-btn:active:not(:disabled) {
+        transform: translateY(0);
+      }
+
+      #start-btn:disabled {
+        opacity: 0.65;
+        cursor: progress;
+      }
+
+      /* Stop state: all services confirmed up */
+      #start-btn.stop-mode {
+        background: linear-gradient(135deg, #9c3b2e, #6e2419);
+        color: #f2d3cc;
+        box-shadow: 0 4px 20px rgba(156, 59, 46, 0.3);
+      }
+
+      #start-btn.stop-mode:hover:not(:disabled) {
+        box-shadow: 0 6px 25px rgba(156, 59, 46, 0.5);
+      }
+
+      .start-status {
+        font-size: 12px;
+        color: rgba(212, 167, 38, 0.6);
+        min-height: 18px;
+        text-align: center;
+        max-width: 520px;
+      }
+
+      .start-status.warn {
+        color: #d99a4e;
+      }
+
+      /* Recording indicator */
+      .rec-dot {
+        position: absolute;
+        bottom: 20px;
+        width: 10px;
+        height: 10px;
+        background: #c0392b;
+        border-radius: 50%;
+        opacity: 0;
+        transition: opacity 0.3s;
+      }
+
+      .rec-dot.active {
+        opacity: 1;
+        animation: blink 1s infinite;
+      }
+
+      @keyframes blink {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.3;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Music-reactive backdrop. Purely decorative, hidden from assistive
+         tech; all of it is driven by the --energy/--bass/--beat variables. -->
+    <div class="ambient" aria-hidden="true">
+      <div class="blob one"></div>
+      <div class="blob two"></div>
+      <div class="blob three"></div>
+    </div>
+    <div class="beat-flash" id="beat-flash" aria-hidden="true"></div>
+
+    <!-- Media player: fixed top-right, drives the Windows media session -->
+    <div class="media-player idle" id="media-player">
+      <div class="media-info">
+        <div class="media-label">Now Playing</div>
+        <div class="media-title" id="media-title" aria-live="polite">
+          Nothing playing
+        </div>
+        <div class="media-artist" id="media-artist"></div>
+      </div>
+      <div
+        class="media-controls"
+        role="group"
+        aria-label="Media playback controls"
+      >
+        <button
+          type="button"
+          class="media-btn"
+          aria-label="Previous track"
+          onclick="mediaControl('previous')"
+        >
+          &#9198;
+        </button>
+        <button
+          type="button"
+          class="media-btn play"
+          id="media-play"
+          aria-label="Play"
+          onclick="mediaControl('toggle')"
+        >
+          &#9654;
+        </button>
+        <button
+          type="button"
+          class="media-btn"
+          aria-label="Next track"
+          onclick="mediaControl('next')"
+        >
+          &#9197;
+        </button>
+      </div>
+    </div>
+
+    <div class="container">
+      <!-- Circular audio visualizer -->
+      <div class="visualizer-wrapper">
+        <div class="ring-outer"></div>
+        <div class="ring-inner"></div>
+        <div class="center-content">
+          <img class="icon" src="angel-logo.png" alt="Angel" />
+          <span class="name">Angel</span>
+        </div>
+        <canvas class="waveform-canvas" id="waveform"></canvas>
+        <div class="rec-dot" id="rec-dot"></div>
+      </div>
+
+      <!-- Text I/O boxes -->
+      <div class="text-area">
+        <div class="text-box">
+          <div class="text-box-label">Your Input</div>
+          <textarea
+            id="user-input"
+            class="text-box-content"
+            placeholder="Type or speak..."
+          ></textarea>
+        </div>
+        <div class="text-box">
+          <div class="text-box-label">Angel</div>
+          <div id="llm-output" class="text-box-content"></div>
+        </div>
+      </div>
+
+      <!-- Service status + start/stop toggle -->
+      <div class="service-pills">
+        <div class="pill" id="pill-ollama"><span class="dot"></span>Ollama</div>
+        <div class="pill" id="pill-tts"><span class="dot"></span>TTS</div>
+        <div class="pill" id="pill-rvc"><span class="dot"></span>RVC</div>
+      </div>
+
+      <button id="start-btn" onclick="toggleServices()">
+        Start All Services
+      </button>
+      <div id="start-status" class="start-status"></div>
+
+      <audio id="player" style="display: none"></audio>
+    </div>
+
+    <script>
+      // ─── Audio Visualizer ───────────────────────────────────────────────
+      const canvas = document.getElementById("waveform");
+      const ctx = canvas.getContext("2d");
+
+      // High-DPI canvas
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = 200 * dpr;
+      canvas.height = 50 * dpr;
+      ctx.scale(dpr, dpr);
+
+      const barCount = 40;
+      const barWidth = 3;
+      const barGap = 2;
+
+      // Each bar eases toward a target so the motion stays fluid whether the
+      // source is real audio or the idle shimmer.
+      const bars = Array.from({ length: barCount }, () => ({
+        height: 2,
+        target: 2,
+      }));
+
+      // Set to true while a reply is playing; drives real vs. idle rendering.
+      let speaking = false;
+
+      // Web Audio graph, built lazily on first playback. Constructing an
+      // AudioContext before a user gesture leaves it suspended.
+      let audioCtx = null;
+      let analyser = null;
+      let freqData = null;
+
+      function connectAnalyser() {
+        if (audioCtx) {
+          if (audioCtx.state === "suspended") audioCtx.resume();
+          return;
+        }
+        try {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          // createMediaElementSource can only be called once per element, which
+          // is why the whole graph is cached rather than rebuilt per reply.
+          const source = audioCtx.createMediaElementSource(player);
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 256;
+          analyser.smoothingTimeConstant = 0.75;
+          freqData = new Uint8Array(analyser.frequencyBinCount);
+          source.connect(analyser);
+          analyser.connect(audioCtx.destination);
+        } catch (e) {
+          // Visualizer degrades to the idle animation; playback still works.
+          analyser = null;
+        }
+      }
+
+      function animateWaveform() {
+        ctx.clearRect(0, 0, 200, 50);
+
+        const totalWidth = barCount * (barWidth + barGap);
+        const startX = (200 - totalWidth) / 2;
+
+        if (speaking && analyser) {
+          analyser.getByteFrequencyData(freqData);
+        }
+
+        // Angel's voice wins the bars while she talks; music drives them the
+        // rest of the time.
+        const musicBars = !speaking && music.live;
+
+        for (let i = 0; i < barCount; i++) {
+          if (speaking && analyser) {
+            // Sample the lower ~70% of the spectrum, where speech energy sits.
+            const bin = Math.floor((i / barCount) * freqData.length * 0.7);
+            bars[i].target = 2 + (freqData[bin] / 255) * 44;
+          } else if (musicBars) {
+            // 12 server bands stretched across 40 bars, mirrored so the low
+            // end sits in the middle like a typical spectrum display.
+            const half = barCount / 2;
+            const fromCentre = Math.abs(i - half + 0.5) / half;
+            const band = Math.min(
+              music.bands.length - 1,
+              Math.floor(fromCentre * music.bands.length),
+            );
+            bars[i].target = 2 + music.bands[band] * 44;
+          } else if (Math.random() < 0.05) {
+            bars[i].target = Math.random() * 12 + 2;
+          }
+
+          bars[i].height += (bars[i].target - bars[i].height) * 0.25;
+
+          const x = startX + i * (barWidth + barGap);
+          const h = Math.max(bars[i].height, 1.5);
+          const y = (50 - h) / 2;
+
+          const grad = ctx.createLinearGradient(x, y, x, y + h);
+          grad.addColorStop(0, "rgba(212, 167, 38, 0.9)");
+          grad.addColorStop(1, "rgba(212, 167, 38, 0.4)");
+
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.roundRect(x, y, barWidth, h, 1.5);
+          ctx.fill();
+        }
+
+        requestAnimationFrame(animateWaveform);
+      }
+
+      // ─── Music reactivity ───────────────────────────────────────────────
+      // The server captures system audio (WASAPI loopback) because a page can
+      // only analyse audio it plays itself, and the music lives in Spotify or
+      // another tab. One SSE stream carries the levels.
+      //
+      // Loopback hears Angel too, since she comes out of the same speakers.
+      // Frames are therefore ignored while her audio element is playing —
+      // otherwise her voice would drive the "music" visuals.
+      //
+      // NOTE: `music` MUST be declared before animateWaveform() runs. The
+      // animation loop reads music.live, and a `const` is in its temporal dead
+      // zone until this statement executes — calling the loop first threw a
+      // ReferenceError that killed the whole script (dead Enter key, missing
+      // visualizer, dead media buttons).
+      const music = {
+        live: false,
+        energy: 0,
+        bass: 0,
+        beat: 0,
+        bands: new Array(12).fill(0),
+        lastBeatSeen: 0,
+        beatFlash: 0,
+      };
+
+      const root = document.documentElement;
+
+      function startLevelStream() {
+        let stream;
+        try {
+          stream = new EventSource("/levels");
+        } catch (e) {
+          return; // no reactivity; everything else still works
+        }
+
+        stream.onmessage = (event) => {
+          let frame;
+          try {
+            frame = JSON.parse(event.data);
+          } catch (e) {
+            return;
+          }
+
+          if (speaking) {
+            // Her own voice. Let the music state fall away instead of tracking
+            // it, so the glow settles while she speaks.
+            music.live = false;
+            return;
+          }
+
+          music.live = !!frame.active && frame.level > 0.02;
+          music.energy = frame.level || 0;
+          music.bass = frame.bass || 0;
+          music.bands = frame.bands || music.bands;
+
+          if (frame.beat > music.lastBeatSeen) {
+            // A frame can cover more than one beat at high tempo; either way
+            // one flash per frame reads correctly.
+            music.beatFlash = 1;
+            music.lastBeatSeen = frame.beat;
+          }
+        };
+
+        stream.onerror = () => {
+          // EventSource reconnects on its own; just stop reacting meanwhile.
+          music.live = false;
+        };
+      }
+
+      // Decay and publish on the animation frame rather than per message, so
+      // the glow interpolates smoothly between 30Hz updates.
+      let shownEnergy = 0;
+      let shownBass = 0;
+
+      function paintReactive() {
+        const targetEnergy = music.live ? music.energy : 0;
+        const targetBass = music.live ? music.bass : 0;
+
+        shownEnergy += (targetEnergy - shownEnergy) * 0.18;
+        shownBass += (targetBass - shownBass) * 0.22;
+        music.beatFlash *= 0.86; // exponential falloff after each beat
+
+        root.style.setProperty("--energy", shownEnergy.toFixed(3));
+        root.style.setProperty("--bass", shownBass.toFixed(3));
+        root.style.setProperty("--beat", music.beatFlash.toFixed(3));
+
+        requestAnimationFrame(paintReactive);
+      }
+
+      animateWaveform();
+      paintReactive();
+      startLevelStream();
+
+      // ─── Chat pipeline ──────────────────────────────────────────────────
+      const userInput = document.getElementById("user-input");
+      const llmOutput = document.getElementById("llm-output");
+      const player = document.getElementById("player");
+
+      userInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      });
+
+      let sending = false;
+
+      function formatTimings(
+        textTimings = {},
+        voiceTimings = {},
+        command = false,
+      ) {
+        const parts = [];
+        if (command) parts.push("command");
+        if (textTimings.command_ms)
+          parts.push(`cmd ${textTimings.command_ms}ms`);
+        if (textTimings.llm_ms) parts.push(`llm ${textTimings.llm_ms}ms`);
+        if (voiceTimings.voice_queue_ms)
+          parts.push(`queue ${voiceTimings.voice_queue_ms}ms`);
+        if (voiceTimings.tts_ms) parts.push(`tts ${voiceTimings.tts_ms}ms`);
+        if (voiceTimings.rvc_ms) parts.push(`rvc ${voiceTimings.rvc_ms}ms`);
+        return parts.join("  ·  ");
+      }
+
+      async function sendMessage() {
+        const text = userInput.value.trim();
+        if (!text || sending) return;
+
+        sending = true;
+        pendingAction = null;
+        userInput.value = "";
+        llmOutput.textContent = "Thinking...";
+
+        try {
+          const chatResponse = await fetch("/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text }),
+          });
+          const chat = await chatResponse.json();
+
+          if (chat.status !== "ok") {
+            llmOutput.textContent = "Error: " + (chat.message || "unknown");
+            commitAction();
+            return;
+          }
+
+          // Text appears as soon as Ollama is done. Voice rendering continues
+          // in a second request instead of hiding the reply behind TTS + RVC.
+          llmOutput.textContent = chat.reply;
+          pendingAction = chat.action || null;
+
+          const expression = chat.expression?.length
+            ? ` · ${chat.expression.join(", ")}`
+            : "";
+          const textMs = chat.timings?.text_total_ms || chat.timings?.llm_ms;
+          setStatus(
+            `${textMs ? `reply ${textMs}ms · ` : ""}generating voice${expression}...`,
+          );
+
+          const voiceResponse = await fetch("/speak", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: chat.speech || chat.reply }),
+          });
+          const voice = await voiceResponse.json();
+
+          if (voice.status !== "ok") {
+            setStatus("Voice error: " + (voice.message || "unknown"), true);
+            commitAction();
+            return;
+          }
+
+          const timingText = formatTimings(
+            chat.timings,
+            voice.timings,
+            chat.command,
+          );
+          if (voice.warnings?.length) {
+            setStatus(
+              [timingText, ...voice.warnings].filter(Boolean).join(" | "),
+              true,
+            );
+          } else {
+            setStatus(timingText);
+          }
+
+          if (voice.audio) playAudio(voice.audio);
+          else commitAction();
+        } catch (err) {
+          llmOutput.textContent = "Failed to reach server: " + err.message;
+          commitAction();
+        } finally {
+          sending = false;
+        }
+      }
+
+      // ─── Deferred command actions ───────────────────────────────────────
+      let pendingAction = null;
+
+      function commitAction() {
+        if (!pendingAction) return;
+        const token = pendingAction;
+        pendingAction = null; // guards against a repeated 'play' event
+
+        fetch("/commit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        })
+          .then((r) => r.json())
+          .then((data) => {
+            if (data.warning) setStatus(data.warning, true);
+            // A committed action may have started music (e.g. "play drake").
+            // Refresh the player so the title appears without waiting for a
+            // manual interaction.
+            setTimeout(refreshNowPlaying, 1500);
+          })
+          .catch(() => {});
+      }
+
+      // ─── Audio playback, feeding the visualizer ─────────────────────────
+      function playAudio(url) {
+        player.src = url;
+        connectAnalyser();
+        player.play().catch((err) => {
+          // Browsers block autoplay until the page has been interacted with.
+          // Clicking the button or typing counts, so this rarely fires. Commit
+          // anyway: with no playback there is no 'play' event to wait for, and
+          // the action would otherwise be silently dropped.
+          setStatus(
+            "Audio ready but playback was blocked: " + err.message,
+            true,
+          );
+          commitAction();
+        });
+      }
+
+      player.addEventListener("play", () => {
+        speaking = true;
+        commitAction();
+      });
+      player.addEventListener("ended", () => (speaking = false));
+      player.addEventListener("pause", () => (speaking = false));
+      // A decode or network failure also means no 'play' event is coming.
+      player.addEventListener("error", () => commitAction());
+
+      // ─── Service status / start / stop ──────────────────────────────────
+      const btn = document.getElementById("start-btn");
+      const startStatus = document.getElementById("start-status");
+
+      // "start" until all three are confirmed up, then flips to "stop".
+      let mode = "start";
+      let busy = false;
+
+      function renderStatus(st) {
+        ["ollama", "tts", "rvc"].forEach((name) => {
+          document
+            .getElementById("pill-" + name)
+            .classList.toggle("up", !!st.services[name]);
+        });
+
+        // The Ollama pill says "up" as soon as the port answers, but the model
+        // isn't resident until it's warm, and a cold model costs ~24s.
+        const pill = document.getElementById("pill-ollama");
+        const warm = st.llm ? st.llm.state : null;
+        pill.textContent = "";
+        pill.appendChild(
+          Object.assign(document.createElement("span"), {
+            className: "dot",
+          }),
+        );
+        pill.append(
+          warm === "warming"
+            ? "Ollama (warming)"
+            : warm === "warm"
+              ? "Ollama (warm)"
+              : "Ollama",
+        );
+        pill.classList.toggle("warming", warm === "warming");
+
+        const ttsPill = document.getElementById("pill-tts");
+        const voiceState = st.voice ? st.voice.state : null;
+        ttsPill.textContent = "";
+        ttsPill.appendChild(
+          Object.assign(document.createElement("span"), {
+            className: "dot",
+          }),
+        );
+        ttsPill.append(voiceState === "warming" ? "TTS (warming)" : "TTS");
+        ttsPill.classList.toggle("warming", voiceState === "warming");
+
+        // Don't fight the in-flight start/stop for control of the button.
+        if (busy) return;
+
+        mode = st.all_up ? "stop" : "start";
+        btn.disabled = false;
+        btn.textContent = st.all_up
+          ? "Stop All Services"
+          : "Start All Services";
+        btn.classList.toggle("stop-mode", st.all_up);
+      }
+
+      function setStatus(msg, warn = false) {
+        startStatus.textContent = msg;
+        startStatus.classList.toggle("warn", warn);
+      }
+
+      function refreshStatus() {
+        return fetch("/status")
+          .then((r) => r.json())
+          .then(renderStatus)
+          .catch(() => {});
+      }
+
+      function toggleServices() {
+        if (busy) return;
+        busy = true;
+        btn.disabled = true;
+
+        const stopping = mode === "stop";
+        btn.textContent = stopping ? "Stopping..." : "Starting...";
+        setStatus(
+          stopping
+            ? "Shutting down gracefully..."
+            : "Launching services. Models take ~20-30s to load.",
+        );
+
+        fetch(stopping ? "/stop" : "/start", { method: "POST" })
+          .then((r) => r.json())
+          .then((data) => {
+            busy = false;
+            setStatus(data.message || "Done.", data.status !== "ok");
+            return refreshStatus();
+          })
+          .catch((err) => {
+            busy = false;
+            btn.disabled = false;
+            setStatus("Request failed: " + err.message, true);
+          });
+      }
+
+      // ─── Media player ───────────────────────────────────────────────────
+      // Reads and drives the Windows media session. The server deliberately
+      // skips the browser session playing Angel's own replies, so these
+      // buttons never pause her mid-sentence.
+      const mediaPlayer = document.getElementById("media-player");
+      const mediaTitle = document.getElementById("media-title");
+      const mediaArtist = document.getElementById("media-artist");
+      const mediaPlay = document.getElementById("media-play");
+
+      const PLAY_ICON = "&#9654;"; // ▶
+      const PAUSE_ICON = "&#9208;"; // ⏸
+
+      function renderNowPlaying(np) {
+        const live = !!(np && np.available);
+        mediaPlayer.classList.toggle("idle", !live);
+        mediaTitle.textContent = live ? np.title : "Nothing playing";
+        mediaArtist.textContent = live
+          ? [np.artist, np.app].filter(Boolean).join(" · ")
+          : "";
+
+        const playing = live && np.playing;
+        mediaPlay.innerHTML = playing ? PAUSE_ICON : PLAY_ICON;
+        mediaPlay.setAttribute("aria-label", playing ? "Pause" : "Play");
+      }
+
+      function refreshNowPlaying() {
+        return fetch("/nowplaying")
+          .then((r) => r.json())
+          .then(renderNowPlaying)
+          .catch(() => {});
+      }
+
+      function mediaControl(action) {
+        fetch("/playback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action }),
+        })
+          .then((r) => r.json())
+          .then((data) => {
+            if (data.status !== "ok" && data.message) {
+              setStatus(data.message, true);
+            }
+            renderNowPlaying(data.now_playing);
+            // Players report the new state a beat after the command lands, so
+            // the icon would otherwise show the previous state until the next
+            // poll came round.
+            setTimeout(refreshNowPlaying, 700);
+          })
+          .catch((err) => setStatus("Playback failed: " + err.message, true));
+      }
+
+      refreshStatus();
+      refreshNowPlaying();
+      setInterval(() => {
+        if (!busy) refreshStatus();
+      }, 3000);
+    </script>
+  </body>
+</html>

@@ -4,9 +4,13 @@ Integrated Voice Assistant — Performance Optimized
 Pipeline: Mic → STT → Command/AI → TTS → RVC → Playback
 UI: PyQt5 dark theme with animated GIF + scrolling terminal
 
+Start these two servers BEFORE running this file:
+    D:\\rvc\\tts_env\\Scripts\\python.exe tts_server.py    (Chatterbox, port 7866)
+    D:\\rvc\\rvc_env\\Scripts\\python.exe rvc_server.py    (Mom.pth,    port 7865)
+
 Performance improvements:
 - Ollama /api/chat with num_predict=60, num_ctx=2048, full GPU offload
-- Azure TTS config reuse (no re-auth per call), faster prosody rate
+- Local Chatterbox TTS held warm in a persistent server (no cloud, no API key)
 - Concurrent TTS+RVC where possible
 - Tight token limits for fast inference on 4060
 """
@@ -14,11 +18,7 @@ Performance improvements:
 import sys
 import os
 import re
-import datetime
 import time
-import random
-import operator
-import webbrowser
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,23 +31,10 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from convo import chat
 from tts import speak as tts_speak
 from rvc import run_rvc
-from song import son, roast
-from Whatsapp import msg
 
-# Optional imports
-try:
-    import pyautogui
-    import keyboard as kb
-    import pywhatkit
-    import pyjokes
-    import speedtest
-    import wikipedia
-    import wolframalpha
-    from PyDictionary import PyDictionary as diction
-    FULL_VA_AVAILABLE = True
-except ImportError as e:
-    print(f"[WARNING] Some VA features unavailable: {e}")
-    FULL_VA_AVAILABLE = False
+# The utility commands ("open google", volume, wikipedia, ...) live in
+# commands.py so the web UI can dispatch the same set without importing Qt.
+from commands import handle_command, FULL_VA_AVAILABLE
 
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -69,20 +56,6 @@ def play_audio(path: str):
         sd.wait()
     except Exception as e:
         print(f"[Audio Error] {e}")
-
-
-# ─── Wolfram Alpha ───────────────────────────────────────────────────────────
-
-def wolfram_query(query: str):
-    """Query Wolfram Alpha. Returns answer string or None."""
-    if not FULL_VA_AVAILABLE:
-        return None
-    try:
-        client = wolframalpha.Client(os.environ.get("WOLFRAM_API_KEY", "YOUR_WOLFRAM_API_KEY_HERE"))
-        res = client.query(query)
-        return next(res.results).text
-    except Exception:
-        return None
 
 
 # ─── Speech Recognition ──────────────────────────────────────────────────────
@@ -177,157 +150,6 @@ def speak_text(text: str):
                 os.remove(f)
             except OSError:
                 pass
-
-
-# ─── Command Handler ─────────────────────────────────────────────────────────
-# Returns: (handled, response_text, mood)
-# mood is "positive" if task succeeded, "negative" if it failed, None if not a command
-
-def handle_command(query: str) -> tuple[bool, str | None, str | None]:
-    """
-    Check if query is a utility command.
-    Returns (handled, response_text, mood).
-    mood: "positive" | "negative" | None
-    """
-    q = query.lower()
-
-    if not FULL_VA_AVAILABLE:
-        return False, None, None
-
-    # ── System Controls ──
-    if "mute" in q and "youtube" not in q:
-        pyautogui.press("volumemute")
-        return True, "muted the volume", "positive"
-
-    if "volume up" in q:
-        for _ in range(5):
-            pyautogui.press("volumeup")
-        return True, "turned the volume up", "positive"
-
-    if "volume down" in q:
-        for _ in range(5):
-            pyautogui.press("volumedown")
-        return True, "turned the volume down", "positive"
-
-    # ── Time ──
-    if "the time" in q:
-        t = datetime.datetime.now().strftime("%I:%M %p")
-        return True, f"told the time, it's {t}", "positive"
-
-    # ── Wikipedia ──
-    if "wikipedia" in q:
-        search = q.replace("wikipedia", "").strip()
-        try:
-            result = wikipedia.summary(search, sentences=2)
-            return True, result, "positive"
-        except Exception:
-            return True, f"couldn't find {search} on Wikipedia", "negative"
-
-    # ── Web Search ──
-    if "search" in q and "youtube" not in q:
-        term = q.replace("search", "").strip()
-        try:
-            pywhatkit.search(term)
-            return True, f"searched for {term}", "positive"
-        except Exception:
-            return True, f"couldn't search for {term}", "negative"
-
-    # ── YouTube ──
-    if "open youtube" in q:
-        webbrowser.open("https://www.youtube.com/")
-        return True, "opened YouTube", "positive"
-
-    if "search on youtube" in q:
-        term = q.replace("search on youtube", "").strip()
-        webbrowser.open(f"https://www.youtube.com/results?search_query={term}")
-        return True, f"searched YouTube for {term}", "positive"
-
-    if "play" in q and "youtube" in q:
-        term = q.replace("play", "").replace("on youtube", "").strip()
-        pywhatkit.playonyt(term)
-        return True, f"playing {term} on YouTube", "positive"
-
-    # ── Google ──
-    if "open google" in q:
-        webbrowser.open("https://google.com")
-        return True, "opened Google", "positive"
-
-    # ── WhatsApp ──
-    if "message" in q:
-        text = q.replace("message", "").strip()
-        try:
-            msg(text)
-            return True, "sent the message", "positive"
-        except Exception:
-            return True, "couldn't send the message", "negative"
-
-    # ── Jokes ──
-    if "joke" in q:
-        joke = pyjokes.get_joke()
-        # Return joke directly, no mood (we speak the joke itself)
-        return True, joke, None
-
-    if "roast me" in q or "insult me" in q:
-        insult = roast(random.randint(1, 12))
-        return True, insult, None
-
-    # ── Speed Test ──
-    if "speed test" in q:
-        try:
-            s = speedtest.Speedtest()
-            s.get_best_server()
-            s.download()
-            s.upload()
-            res = s.results.dict()
-            down = int(res["download"] / 800000)
-            up = int(res["upload"] / 800000)
-            return True, f"Download {down} Mbps, Upload {up} Mbps, Ping {int(res['ping'])}ms", "positive"
-        except Exception:
-            return True, "speed test failed", "negative"
-
-    # ── Temperature ──
-    if "temperature" in q:
-        words = q.split()
-        place = words[-1] if words else "Kolkata"
-        answer = wolfram_query(f"Temperature in {place}")
-        if answer:
-            return True, f"temperature in {place} is {answer}", "positive"
-        return True, f"couldn't get temperature for {place}", "negative"
-
-    # ── Calculator ──
-    if "calculate" in q:
-        expr = q.replace("calculate", "").strip()
-        ops = {
-            '+': operator.add, 'plus': operator.add,
-            '-': operator.sub, 'minus': operator.sub,
-            'x': operator.mul, 'times': operator.mul,
-            '/': operator.truediv, 'divided': operator.truediv,
-        }
-        try:
-            parts = expr.split()
-            result = ops[parts[1]](int(parts[0]), int(parts[2]))
-            return True, f"the answer is {result}", "positive"
-        except Exception:
-            return True, "couldn't calculate that", "negative"
-
-    # ── Music (local) ──
-    if "play" in q and ("music" in q or "song" in q):
-        name = q.replace("play", "").replace("music", "").replace("song", "").strip()
-        try:
-            music_dir = "D:\\Music\\"
-            music_dir2 = "D:\\Music2\\"
-            songs = os.listdir(music_dir)
-            songs2 = os.listdir(music_dir2)
-            son(name, music_dir, music_dir2, songs, songs2)
-            return True, f"playing {name}", "positive"
-        except Exception:
-            try:
-                pywhatkit.playonyt(name)
-                return True, f"playing {name} on YouTube", "positive"
-            except Exception:
-                return True, f"couldn't play {name}", "negative"
-
-    return False, None, None
 
 
 # ─── PyQt5 UI ─────────────────────────────────────────────────────────────────

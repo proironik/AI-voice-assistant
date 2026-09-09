@@ -37,6 +37,11 @@ INDEX_RATE = 0.8
 # Import RVC internals after path setup
 # These imports depend on your RVC installation — adjust if needed
 try:
+    # RVC reads weight_root / index_root / rmvpe_root from .env — without this
+    # load_dotenv() the paths resolve to None and get_vc() fails on "None/Mom.pth".
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=str(RVC_ROOT / ".env"))
+
     from infer.modules.vc.modules import VC
     from configs.config import Config
 
@@ -55,27 +60,40 @@ except ImportError:
 
 _lock = threading.Lock()  # RVC inference is not thread-safe
 
+# Set by a {"command": "shutdown"} request. taskkill without /F cannot reach a
+# console process parked in accept(), so an in-protocol shutdown is what allows
+# this server to stop without a hard kill mid-inference.
+_shutdown = threading.Event()
+_server_sock = None
+
 
 def convert(input_wav: str, output_wav: str) -> str:
     """Run voice conversion. Thread-safe via lock."""
     with _lock:
         if USE_NATIVE:
-            # Direct Python call — no subprocess overhead
-            info, audio = vc.vc_single(
+            # Direct Python call — no subprocess overhead.
+            # NOTE: vc_single requires f0_file and file_index2 (no defaults),
+            # and returns (info, (tgt_sr, audio)).
+            info, (tgt_sr, audio) = vc.vc_single(
                 sid=0,
                 input_audio_path=input_wav,
                 f0_up_key=0,
+                f0_file=None,
                 f0_method=F0_METHOD,
                 file_index=INDEX_PATH,
+                file_index2="",
                 index_rate=INDEX_RATE,
                 filter_radius=3,
                 resample_sr=0,
                 rms_mix_rate=0.25,
                 protect=0.33,
             )
-            # Save output
+            if audio is None:
+                raise RuntimeError(f"RVC inference failed: {info}")
+
+            # Use the model's real sample rate (Mom.pth is 32k, not 40k).
             import soundfile as sf
-            sf.write(output_wav, audio, 40000)
+            sf.write(output_wav, audio, tgt_sr)
         else:
             # Subprocess fallback (still faster than cold-starting every time
             # because this server stays warm)
@@ -123,6 +141,32 @@ def handle_client(conn, addr):
             return
 
         request = json.loads(data.decode("utf-8"))
+
+        # ── Control commands ──
+        if request.get("command") == "shutdown":
+            print("[RVC Server] Shutdown requested.")
+            try:
+                conn.sendall(json.dumps(
+                    {"status": "ok", "message": "shutting down"}
+                ).encode("utf-8"))
+            except Exception:
+                pass
+            # Wait for any in-flight conversion to finish before tearing down,
+            # so a half-written output WAV is never left behind.
+            with _lock:
+                pass
+            _shutdown.set()
+            if _server_sock is not None:
+                try:
+                    _server_sock.close()
+                except Exception:
+                    pass
+            return
+
+        if request.get("command") == "ping":
+            conn.sendall(json.dumps({"status": "ok"}).encode("utf-8"))
+            return
+
         input_path = request["input"]
         output_path = request["output"]
 
@@ -145,24 +189,41 @@ def handle_client(conn, addr):
 
 
 def main():
+    global _server_sock
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen(2)
+    _server_sock = server
     print(f"[RVC Server] Listening on {HOST}:{PORT}")
     print(f"[RVC Server] Model: {MODEL_NAME} | f0: {F0_METHOD}")
     print(f"[RVC Server] Ready for requests.\n")
 
     try:
-        while True:
-            conn, addr = server.accept()
+        while not _shutdown.is_set():
+            try:
+                conn, addr = server.accept()
+            except OSError:
+                # Listener was closed by the shutdown handler.
+                break
             # Handle in thread for non-blocking accept (but inference is serialized)
             t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
             t.start()
     except KeyboardInterrupt:
-        print("\n[RVC Server] Shutting down.")
+        print("\n[RVC Server] Interrupted.")
     finally:
-        server.close()
+        try:
+            server.close()
+        except Exception:
+            pass
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print("[RVC Server] Stopped.")
 
 
 if __name__ == "__main__":

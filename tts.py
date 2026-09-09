@@ -1,60 +1,123 @@
-"""
-Azure TTS Module — optimized.
-Reuses the synthesizer instance to avoid re-auth on every call.
-"""
+"""Client for the persistent local Chatterbox-Turbo TTS server."""
 
-import os
-import azure.cognitiveservices.speech as speechsdk
+import json
+import re
+import socket
+import time
+from pathlib import Path
 
-# ─── Persistent synthesizer (avoids re-handshake every call) ─────────────────
+from expressions import prepare as prepare_expression
 
-_speech_config = speechsdk.SpeechConfig(
-    subscription=os.environ.get("AZURE_SPEECH_KEY", "YOUR_AZURE_SPEECH_KEY_HERE"),
-    region=os.environ.get("AZURE_SPEECH_REGION", "eastus")
+TTS_HOST = "127.0.0.1"
+TTS_PORT = 7866
+SOCKET_TIMEOUT = 120
+RETRIES = 2
+RETRY_DELAY = 1.5
+
+# Turbo controls that are actually consumed by the installed 0.1.7 model.
+# Expression intensity is controlled with native tags such as [chuckle] and
+# [sigh], not exaggeration/cfg_weight (Turbo accepts but ignores those values).
+TEMPERATURE = 0.78
+TOP_P = 0.95
+TOP_K = 1000
+REPETITION_PENALTY = 1.2
+
+# Slightly faster than the old 14.5 chars/s setting. Native Turbo commonly runs
+# at 16-18.5, so 15.5 still sounds conversational while shortening the audio
+# handed to RVC and reducing the amount of time stretching required.
+TARGET_CHARS_PER_SEC = 15.5
+
+
+class TTSServerUnavailable(RuntimeError):
+    """Raised when the Chatterbox TTS server is not reachable."""
+
+
+_EMOJI = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002600-\U000027BF"
+    "\U0000FE00-\U0000FE0F"
+    "\U00002B00-\U00002BFF"
+    "\U0001F000-\U0001F2FF"
+    "\U0000200D"
+    "]+",
+    flags=re.UNICODE,
 )
-_speech_config.speech_synthesis_voice_name = "en-US-AriaNeural"
-# Request compressed audio for faster network transfer
-_speech_config.set_speech_synthesis_output_format(
-    speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
-)
 
 
-def build_ssml(text: str) -> str:
-    """Build SSML with whispering style and slightly faster rate."""
-    # Escape XML special chars
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return f"""<speak version="1.0"
-       xmlns="http://www.w3.org/2001/10/synthesis"
-       xmlns:mstts="http://www.w3.org/2001/mstts"
-       xml:lang="en-US">
-  <voice name="en-US-AriaNeural">
-    <mstts:express-as style="whispering">
-      <prosody rate="0.95" pitch="-0.4st">
-        {text}
-      </prosody>
-    </mstts:express-as>
-  </voice>
-</speak>"""
+def sanitize(text: str) -> str:
+    """Prepare clean prose while preserving only verified native voice tags."""
+    text = _EMOJI.sub("", text)
+    text = prepare_expression(text).speech
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    return text
 
 
 def speak(text: str, output_file: str = "tts.wav") -> str:
-    """
-    Synthesize text to a WAV file using Azure Neural TTS.
-    Returns the output file path.
-    """
-    audio_config = speechsdk.audio.AudioOutputConfig(filename=output_file)
+    """Synthesize ``text`` through the persistent server and return its path."""
+    output_path = str(Path(output_file).resolve())
+    text = sanitize(text)
+    if not text:
+        raise ValueError("Nothing to speak after sanitizing (text was empty).")
 
-    synthesizer = speechsdk.SpeechSynthesizer(
-        speech_config=_speech_config,
-        audio_config=audio_config
-    )
+    request = json.dumps({
+        "text": text,
+        "output": output_path,
+        "temperature": TEMPERATURE,
+        "top_p": TOP_P,
+        "top_k": TOP_K,
+        "repetition_penalty": REPETITION_PENALTY,
+        "target_chars_per_sec": TARGET_CHARS_PER_SEC,
+    }).encode("utf-8")
 
-    result = synthesizer.speak_ssml_async(build_ssml(text)).get()
+    last_error = None
+    for attempt in range(RETRIES + 1):
+        try:
+            return _request(request, output_file)
+        except ConnectionRefusedError as e:
+            raise TTSServerUnavailable(
+                f"Chatterbox TTS server not reachable on {TTS_HOST}:{TTS_PORT} ({e}). "
+                "Start it with: D:\\rvc\\tts_env\\Scripts\\python.exe tts_server.py"
+            ) from e
+        except (ConnectionResetError, socket.timeout, OSError) as e:
+            last_error = e
+            if attempt < RETRIES:
+                time.sleep(RETRY_DELAY)
+                continue
+            raise TTSServerUnavailable(
+                f"TTS request failed after {RETRIES + 1} attempts: {e}"
+            ) from e
 
-    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-        return output_file
-    elif result.reason == speechsdk.ResultReason.Canceled:
-        details = result.cancellation_details
-        raise RuntimeError(f"Azure TTS failed: {details.error_details}")
-    else:
-        raise RuntimeError("Azure TTS failed (unknown reason)")
+    raise TTSServerUnavailable(f"TTS request failed: {last_error}")
+
+
+def _request(payload: bytes, output_file: str) -> str:
+    """Send one synthesis request and return the output path."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(SOCKET_TIMEOUT)
+    try:
+        sock.connect((TTS_HOST, TTS_PORT))
+        sock.sendall(payload)
+        sock.shutdown(socket.SHUT_WR)
+
+        data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        sock.close()
+
+    if not data:
+        raise ConnectionResetError(
+            "TTS server closed the connection without responding."
+        )
+
+    response = json.loads(data.decode("utf-8"))
+    if response.get("status") != "ok":
+        raise RuntimeError(f"TTS failed: {response.get('message')}")
+
+    return output_file
